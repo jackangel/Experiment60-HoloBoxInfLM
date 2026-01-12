@@ -13,13 +13,14 @@ from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder 
 from collections import Counter
+import random
 
 # --- Hyperparameters ---
 VOCAB_SIZE = 4096    
 EMBED_DIM = 512    
 MATRIX_DIM = 64     
 NUM_HEADS = 16       
-HEAD_DIM = MATRIX_DIM // NUM_HEADS
+HEAD_DIM = MATRIX_DIM // NUM_HEADS # 4
 NUM_LAYERS = 2      
 SEQ_LEN = 256       
 ARCHIVE_SIZE = 4096  
@@ -27,7 +28,7 @@ SNAPSHOT_RATE = 128
 BATCH_SIZE = 32    
 LEARNING_RATE = 5e-4 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-CHECKPOINT_PATH = 'infinite_holo_hybrid_v3_enhanced.pth'
+CHECKPOINT_PATH = 'infinite_holo_hybrid_v3_optimized.pth'
 TOKENIZER_FILE = 'hybrid_tokenizer.json'
 
 # --- 1. Stable Box Logic ---
@@ -39,53 +40,24 @@ def stable_box_score(q_min, q_max, v_min, v_max):
     log_vol = torch.mean(torch.log(width + 1e-6), dim=-1) 
     return log_vol 
 
-# --- 2. JIT Associative Core (MULTI-HEAD FIX) ---
-@torch.jit.script
-def holo_hybrid_scan(x, memory, rarity, 
-                    w_k, b_k, w_q, b_q, w_v, b_v, w_out, b_out, 
-                    w_gw, b_gw, w_gf, b_gf,
-                    num_heads: int, head_dim: int):
-    # Inputs:
-    # x: (B, T, Embed)
-    # memory: (B, Heads, Head_Dim, Head_Dim)
+# --- 2. Parallel Associative Core ---
+def holo_parallel_scan(k, q, v, gf, gw):
+    B, T, H, D = k.shape
+    # Updates: Outer product (v @ k.T) scaled by write gate
+    updates = torch.matmul(v.unsqueeze(-1), k.unsqueeze(-2)) * gw.unsqueeze(-1).unsqueeze(-1)
     
-    B, T, C = x.size()
-    outputs: list[torch.Tensor] = []
+    # Log-space accumulation for perfect stability
+    log_gf = torch.log(gf.clamp(min=1e-8)).unsqueeze(-1).unsqueeze(-1)
+    cum_log_gf = torch.cumsum(log_gf, dim=1)
+    exp_cum_gf = torch.exp(cum_log_gf)
     
-    # Project and reshape for Multi-Head: (B, T, Heads, Head_Dim)
-    k_all = F.normalize(F.linear(x, w_k, b_k).view(B, T, num_heads, head_dim), p=2.0, dim=-1)
-    q_all = F.normalize(F.linear(x, w_q, b_q).view(B, T, num_heads, head_dim), p=2.0, dim=-1)
-    v_all = torch.tanh(F.linear(x, w_v, b_v).view(B, T, num_heads, head_dim))
+    # Prefix-sum scan logic
+    weighted_updates = updates / (exp_cum_gf + 1e-8)
+    state = torch.cumsum(weighted_updates, dim=1) * exp_cum_gf
     
-    # Gates: (B, T, Heads)
-    gw_all = torch.sigmoid(F.linear(x, w_gw, b_gw).view(B, T, num_heads)) * (0.5 + 0.5 * rarity)
-    gf_all = torch.sigmoid(F.linear(x, w_gf, b_gf).view(B, T, num_heads)) * (0.9 + 0.1 * (1.0 - rarity))
-    
-    for t in range(T):
-        k, q, v = k_all[:, t], q_all[:, t], v_all[:, t]
-        
-        # Gates: (B, Heads, 1, 1) for broadcasting
-        beta = gw_all[:, t].unsqueeze(-1).unsqueeze(-1)
-        decay = gf_all[:, t].unsqueeze(-1).unsqueeze(-1)
-        
-        # Readout: (B, Heads, Dim, Dim) @ (B, Heads, Dim, 1) -> (B, Heads, Dim)
-        readout = torch.matmul(memory, q.unsqueeze(-1)).squeeze(-1)
-        
-        # Association: 
-        # v: (B, Heads, Dim) -> (B, Heads, Dim, 1)
-        # k: (B, Heads, Dim) -> (B, Heads, 1, Dim) (Use -2 to insert before last dim)
-        association = torch.matmul(v.unsqueeze(-1), k.unsqueeze(-2))
-        
-        # Update Memory
-        memory = (decay * memory) + (beta * association)
-        outputs.append(readout)
-    
-    # Stack: (B, T, Heads, Head_Dim)
-    stacked = torch.stack(outputs, dim=1)
-    # Flatten heads: (B, T, Heads * Head_Dim)
-    stacked = stacked.view(B, T, num_heads * head_dim)
-    
-    return F.linear(stacked, w_out, b_out), memory
+    # Readout: M @ q
+    readout = torch.matmul(state, q.unsqueeze(-1)).squeeze(-1)
+    return readout, state[:, -1]
 
 # --- 3. Memory Archive ---
 class HoloArchive:
@@ -100,7 +72,6 @@ class HoloArchive:
         self.count = 0
 
     def add(self, b_min, b_max, matrix):
-        # Store LAST token of batch as key
         self.keys_min[self.ptr] = b_min[:, -1, :].mean(dim=0).detach()
         self.keys_max[self.ptr] = b_max[:, -1, :].mean(dim=0).detach()
         self.values[self.ptr] = matrix.mean(dim=0).detach()
@@ -127,7 +98,7 @@ class InfiniteHoloGPT(nn.Module):
             HoloHybridBlock(embed_dim, matrix_dim, NUM_HEADS) for _ in range(layers)
         ])
         self.ln_f = nn.LayerNorm(embed_dim)
-        self.logit_scale = nn.Parameter(torch.ones(1) * 10.0) 
+        self.logit_scale = nn.Parameter(torch.ones(1) * 12.0)
         
     def forward(self, idx, states=None, archive=None, rarity=None):
         b_min, b_max = self.box_emb(idx)
@@ -163,84 +134,81 @@ class HoloHybridBlock(nn.Module):
         self.gate_write = nn.Linear(embed_dim, num_heads)
         self.gate_forget = nn.Linear(embed_dim, num_heads)
         
-        # Adaptive Memory Gate
+        nn.init.constant_(self.gate_forget.bias, 12.0)
+        nn.init.constant_(self.gate_write.bias, -12.0)
+        
         self.archive_gate = nn.Linear(embed_dim, 1)
-        nn.init.constant_(self.archive_gate.bias, -3.0) 
+        nn.init.constant_(self.archive_gate.bias, -4.0) 
         
         self.ln1, self.ln2 = nn.LayerNorm(embed_dim), nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(nn.Linear(embed_dim, 4*embed_dim), nn.GELU(), nn.Linear(4*embed_dim, embed_dim))
 
     def forward(self, x, b_min, b_max, memory=None, archive=None, rarity=None):
         B, T, C = x.shape
-        if memory is None: 
-            memory = torch.zeros(B, self.num_heads, self.head_dim, self.head_dim, device=x.device)
         
+        # --- Archive Retrieval Logic (Multi-Head Corrected) ---
         archive_context = torch.zeros_like(x)
-        
-        # --- Top-K Sparse Retrieval ---
         if archive is not None and archive.count > 10:
             q_min, q_max = b_min.mean(dim=1, keepdim=True), b_max.mean(dim=1, keepdim=True)
-            
             valid_count = archive.count
-            keys_min = archive.keys_min[:valid_count].unsqueeze(0)
-            keys_max = archive.keys_max[:valid_count].unsqueeze(0)
+            scores = stable_box_score(q_min, q_max, archive.keys_min[:valid_count].unsqueeze(0), archive.keys_max[:valid_count].unsqueeze(0))
+            weights = F.softmax(scores, dim=-1).reshape(B, 1, valid_count, 1, 1, 1)
             
-            scores = stable_box_score(q_min, q_max, keys_min, keys_max) # (B, 1, Count)
-            
-            k = min(8, valid_count)
-            top_scores, top_indices = torch.topk(scores, k, dim=-1) # (B, 1, K)
-            
-            weights = F.softmax(top_scores, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            
-            flat_indices = top_indices.squeeze(1).view(-1)
-            retrieved_raw = archive.values[flat_indices]
-            retrieved_raw = retrieved_raw.view(B, k, self.num_heads, self.head_dim, self.head_dim)
-            
-            fused_mem = torch.sum(weights.squeeze(1) * retrieved_raw, dim=1) 
-            
-            q_curr = F.normalize(self.proj_q(x).view(B, T, self.num_heads, self.head_dim), p=2.0, dim=-1)
-            
-            fused_mem_expanded = fused_mem.unsqueeze(1) 
-            archive_read = torch.matmul(fused_mem_expanded, q_curr.unsqueeze(-1)).squeeze(-1)
-            
-            archive_read = archive_read.view(B, T, -1)
-            archive_context = self.proj_out(archive_read)
+            # Weighted average of archive matrices
+            fused_mem = torch.sum(weights * archive.values[:valid_count].reshape(1, 1, valid_count, self.num_heads, self.head_dim, self.head_dim), dim=2)
+            q_ret = F.normalize(self.proj_q(x).reshape(B, T, self.num_heads, self.head_dim), p=2.0, dim=-1)
+            archive_read = torch.matmul(fused_mem, q_ret.unsqueeze(-1)).squeeze(-1)
+            archive_context = self.proj_out(archive_read.reshape(B, T, -1))
 
         x_n = self.ln1(x)
-        m_out, new_mem = holo_hybrid_scan(
-            x_n, memory, rarity, 
-            self.proj_k.weight, self.proj_k.bias, 
-            self.proj_q.weight, self.proj_q.bias, 
-            self.proj_v.weight, self.proj_v.bias, 
-            self.proj_out.weight, self.proj_out.bias, 
-            self.gate_write.weight, self.gate_write.bias, 
-            self.gate_forget.weight, self.gate_forget.bias,
-            self.num_heads, self.head_dim
-        )
+        # Projections
+        k = F.normalize(self.proj_k(x_n).reshape(B, T, self.num_heads, self.head_dim), p=2.0, dim=-1)
+        q = F.normalize(self.proj_q(x_n).reshape(B, T, self.num_heads, self.head_dim), p=2.0, dim=-1)
+        v = torch.tanh(self.proj_v(x_n).reshape(B, T, self.num_heads, self.head_dim))
         
-        if archive is not None and archive.count > 10:
-            g_mem = torch.sigmoid(self.archive_gate(x)) 
-            x = x + m_out + (g_mem * archive_context)
-        else:
-            x = x + m_out
-            
-        x = x + self.ffn(self.ln2(x))
-        return x, new_mem
+        # Optimization Gating
+        gf = 1.0 - torch.pow(1.0 - torch.sigmoid(self.gate_forget(x_n)), 2).reshape(B, T, self.num_heads)
+        gw = torch.pow(torch.sigmoid(self.gate_write(x_n)), 2).reshape(B, T, self.num_heads)
+        
+        gw = gw * (0.5 + 0.5 * rarity.reshape(B, T, 1))
+        gf = gf * (0.9 + 0.1 * (1.0 - rarity.reshape(B, T, 1)))
 
-# --- 5. Utilities ---
+        if T > 1 or memory is None:
+            if memory is None: memory = torch.zeros(B, self.num_heads, self.head_dim, self.head_dim, device=x.device)
+            m_out_heads, next_mem = holo_parallel_scan(k, q, v, gf, gw)
+            m_out = self.proj_out(m_out_heads.reshape(B, T, -1))
+        else:
+            # RECURRENT INFERENCE PATH (Fixed Matmuls)
+            k_s, q_s, v_s = k.squeeze(1), q.squeeze(1), v.squeeze(1) # (B, H, D)
+            gf_s, gw_s = gf.squeeze(1), gw.squeeze(1) # (B, H)
+            
+            # Association: (B, H, D, 1) @ (B, H, 1, D) -> (B, H, D, D)
+            assoc = torch.matmul(v_s.unsqueeze(-1), k_s.unsqueeze(-2))
+            next_mem = (gf_s.reshape(B, self.num_heads, 1, 1) * memory) + (gw_s.reshape(B, self.num_heads, 1, 1) * assoc)
+            
+            # Readout: (B, H, D, D) @ (B, H, D, 1) -> (B, H, D)
+            m_out_heads = torch.matmul(next_mem, q_s.unsqueeze(-1)).squeeze(-1)
+            m_out = self.proj_out(m_out_heads.reshape(B, 1, -1))
+
+        # Add Context and FFN
+        g_mem = torch.sigmoid(self.archive_gate(x))
+        x = x + m_out + (g_mem * archive_context)
+        x = x + self.ffn(self.ln2(x))
+        return x, next_mem
+
+# --- 5. Training / Utils ---
 def generate_sample(model, tokenizer, archive, length=50):
     model.eval()
     context = torch.tensor(tokenizer.encode("ROMEO:").ids).unsqueeze(0).to(DEVICE)
     states = None
     output = "VALIDATION: "
-    print(f"\n--- Generating (Archive Size: {archive.count}) ---")
     with torch.no_grad():
         for _ in range(length):
             logits, states = model(context, states=states, archive=archive)
             next_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0)
             output += tokenizer.decode([next_id.item()])
             context = next_id
-    print(f"{output}\n")
+    print(f"\n{output}\n")
     model.train()
 
 def train():
@@ -263,20 +231,19 @@ def train():
     
     model = InfiniteHoloGPT(VOCAB_SIZE, EMBED_DIM, MATRIX_DIM, NUM_LAYERS).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
-    
     archive = HoloArchive(ARCHIVE_SIZE, NUM_HEADS, HEAD_DIM, EMBED_DIM)
     
-    pbar = tqdm(range(5001), desc="Training Infinite Holo v3.1 Enhanced")
+    pbar = tqdm(range(5001), desc="Training Optimized Holo V3")
     for step in pbar:
-        ix = torch.randint(len(data) - SEQ_LEN - 1, (BATCH_SIZE,))
-        xb = torch.stack([data[i:i+SEQ_LEN] for i in ix]).to(DEVICE)
-        yb = torch.stack([data[i+1:i+SEQ_LEN+1] for i in ix]).to(DEVICE)
+        curr_len = random.randint(SEQ_LEN // 2, SEQ_LEN)
+        ix = torch.randint(len(data) - curr_len - 1, (BATCH_SIZE,))
+        xb = torch.stack([data[i:i+curr_len] for i in ix]).to(DEVICE)
+        yb = torch.stack([data[i+1:i+curr_len+1] for i in ix]).to(DEVICE)
         
         batch_rarity = rarity_lookup[xb].unsqueeze(-1)
-        
         logits, states = model(xb, archive=archive, rarity=batch_rarity)
-        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), yb.view(-1))
         
+        loss = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), yb.reshape(-1))
         optimizer.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
         
@@ -295,11 +262,10 @@ def chat():
     tokenizer = Tokenizer.from_file(TOKENIZER_FILE); tokenizer.decoder = ByteLevelDecoder()
     model = InfiniteHoloGPT(VOCAB_SIZE, EMBED_DIM, MATRIX_DIM, NUM_LAYERS).to(DEVICE)
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=True))
-    model.eval()
-    archive = HoloArchive(ARCHIVE_SIZE, NUM_HEADS, HEAD_DIM, EMBED_DIM)
+    model.eval(); archive = HoloArchive(ARCHIVE_SIZE, NUM_HEADS, HEAD_DIM, EMBED_DIM)
     states = None
     
-    print("\n--- Infinite Holo-Hybrid v3.1 Enhanced Ready ---")
+    print("\n--- Infinite Holo-Hybrid Optimized Ready ---")
     while True:
         prompt = input("\nYou: ")
         if not prompt or prompt.lower() == 'exit': break
